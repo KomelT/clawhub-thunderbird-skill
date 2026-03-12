@@ -33,6 +33,10 @@ If the current working directory is not the skill directory, resolve `scripts/se
    - `--subject-only`
    - `--body-only`
    - `--exclude wordpress`
+   - `--has-attachment`
+   - `--attachment-name invoice`
+   - `--list-attachments`
+   - `--save-attachments ./out`
    - `--today`
    - `--yesterday`
    - `--since 2026-03-11`
@@ -45,7 +49,7 @@ If the current working directory is not the skill directory, resolve `scripts/se
 
 ### 1. Pick the profile
 
-Use `--list-profiles` first if the profile is unknown. Accept either:
+Use `--list-profiles` first if the profile is unknown. The script now checks common Thunderbird profile roots on Windows and Linux automatically. Accept either:
 
 - absolute profile path
 - exact profile directory name
@@ -76,6 +80,7 @@ It supports:
 
 - mbox folders such as `Inbox`, `Sent`, `Archives`
 - Maildir folders containing `cur/` and `new/`
+- common profile discovery on Windows and Linux (`%APPDATA%/Thunderbird/Profiles`, `~/.thunderbird`, `~/.mozilla/thunderbird`)
 
 ### 4. Return useful results
 
@@ -141,6 +146,13 @@ python scripts/search_thunderbird.py --profile default-release --account user@ex
 python scripts/search_thunderbird.py --profile default-release --account user@example.com --folder inbox --query update --exclude wordpress --limit 20
 ```
 
+### Find messages with attachments or save them
+
+```powershell
+python scripts/search_thunderbird.py --profile default-release --account user@example.com --folder inbox --has-attachment --list-attachments --limit 20
+python scripts/search_thunderbird.py --profile default-release --account user@example.com --attachment-name invoice --save-attachments .\out --limit 20
+```
+
 ### Sort messages by sender or subject
 
 ```powershell
@@ -173,9 +185,34 @@ python scripts/search_thunderbird.py --profile default-release --account user@ex
 - If a message is not found, mention that local Thunderbird storage may not contain it or may not have synced it.
 - When the user names an email address, prefer `--account` before broader searches.
 - `--unread-only` depends on Thunderbird folder indexes (`.msf`) for mbox folders; if unread state is unavailable, say so instead of guessing.
-- `--since` and `--until` accept `YYYY-MM-DD` or ISO-8601 timestamps. Bare dates are interpreted as UTC midnight.
+- `--since` and `--until` accept `YYYY-MM-DD` or ISO-8601 timestamps. Bare `--since` dates are interpreted as UTC midnight, while bare `--until` dates are interpreted as UTC end-of-day.
 - `--today` and `--yesterday` are UTC-based shortcuts and cannot be combined with `--since` or `--until`.
 - `--subject-only` and `--body-only` only change how `--query` is matched; do not combine them with each other.
+- `--has-attachment` filters to messages with attachments; `--attachment-name` filters by attachment filename.
+- `--save-attachments <dir>` writes matching attachments to disk and implicitly enables attachment-aware filtering when needed.
+
+## Attachment interaction policy
+
+When the user asks for an attachment, do not save or open it immediately unless they already said what they want done.
+
+Default follow-up:
+
+- `Should I save it or open it?`
+
+If the user says **save**:
+
+- ask where to save it if they did not already specify a location
+- then use `--save-attachments <dir>`
+- return the final saved path(s)
+
+If the user says **open**:
+
+- first extract the attachment to a temporary or user-requested location
+- then open it with the system default app from the CLI
+- prefer the platform default opener instead of inventing app-specific commands
+- mention the file path you opened
+
+If the attachment is text-like and the user likely wants contents rather than launching an external app, it is also acceptable to read or summarize it directly after asking.
 
 ## Reference
 

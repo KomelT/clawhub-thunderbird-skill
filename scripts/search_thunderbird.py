@@ -26,10 +26,15 @@ from datetime import datetime, timezone
 from email import policy
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 APPDATA = Path(os.environ.get("APPDATA", ""))
-DEFAULT_PROFILES_DIR = APPDATA / "Thunderbird" / "Profiles"
+HOME = Path.home()
+DEFAULT_PROFILE_ROOTS = [
+    APPDATA / "Thunderbird" / "Profiles",
+    HOME / ".thunderbird",
+    HOME / ".mozilla" / "thunderbird",
+]
 SKIP_DIRS = {".mozmsgs", "cur", "new", "tmp"}
 BODY_MIME_PREFIXES = ("text/plain", "text/html")
 FOLDER_ALIASES = {
@@ -50,17 +55,34 @@ def configure_stdout() -> None:
         pass
 
 
-def list_profiles(profiles_dir: Path = DEFAULT_PROFILES_DIR) -> List[Path]:
-    if not profiles_dir.exists():
-        return []
-    return sorted([p for p in profiles_dir.iterdir() if p.is_dir()])
+def existing_profile_roots() -> List[Path]:
+    unique_roots: List[Path] = []
+    for root in DEFAULT_PROFILE_ROOTS:
+        if not root:
+            continue
+        expanded = root.expanduser()
+        if expanded.exists() and expanded not in unique_roots:
+            unique_roots.append(expanded)
+    return unique_roots
+
+
+def list_profiles(profiles_dir: Optional[Path] = None) -> List[Path]:
+    roots = [profiles_dir] if profiles_dir else existing_profile_roots()
+    profiles: List[Path] = []
+    for root in roots:
+        if not root or not root.exists():
+            continue
+        for path in root.iterdir():
+            if path.is_dir() and path not in profiles:
+                profiles.append(path)
+    return sorted(profiles)
 
 
 def resolve_profile(profile_arg: Optional[str]) -> Path:
     profiles = list_profiles()
     if profile_arg:
         candidate = Path(profile_arg).expanduser()
-        if candidate.exists():
+        if candidate.exists() and candidate.is_dir():
             return candidate
         matches = [p for p in profiles if p.name == profile_arg or profile_arg.lower() in p.name.lower()]
         if len(matches) == 1:
@@ -72,7 +94,8 @@ def resolve_profile(profile_arg: Optional[str]) -> Path:
     if len(profiles) == 1:
         return profiles[0]
     if not profiles:
-        raise SystemExit(f"No Thunderbird profiles found under {DEFAULT_PROFILES_DIR}")
+        searched = ", ".join(str(root) for root in existing_profile_roots()) or ", ".join(str(root) for root in DEFAULT_PROFILE_ROOTS)
+        raise SystemExit(f"No Thunderbird profiles found. Searched: {searched}")
     names = ", ".join(p.name for p in profiles)
     raise SystemExit(f"Multiple profiles found. Pass --profile. Available: {names}")
 
@@ -106,13 +129,18 @@ def list_accounts(profile: Path) -> List[dict]:
     for account_id, server_id in sorted(account_servers.items()):
         server = servers.get(server_id, {})
         emails = [identities[i] for i in account_identities.get(account_id, []) if i in identities]
+        directory = server.get("directory", "")
+        if not directory and server.get("directory-rel"):
+            rel_value = server.get("directory-rel", "")
+            if rel_value.startswith("[ProfD]"):
+                directory = str(profile / rel_value[len("[ProfD]"):].lstrip("/\\"))
         results.append({
             "account": account_id,
             "server": server_id,
             "email": emails[0] if emails else server.get("userName") or server.get("name") or "",
             "hostname": server.get("hostname", ""),
             "name": server.get("name", ""),
-            "directory": server.get("directory", ""),
+            "directory": directory,
         })
     return results
 
@@ -179,6 +207,25 @@ def iter_maildir_dirs(profile: Path, account: Optional[dict] = None, folder: Opt
                 dirnames[:] = []
 
 
+def sanitize_filename(name: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', '_', name).strip()
+    return cleaned or 'attachment.bin'
+
+
+def extract_attachments(msg: email.message.Message) -> List[Tuple[str, bytes]]:
+    attachments: List[Tuple[str, bytes]] = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        disposition = (part.get_content_disposition() or '').lower()
+        if not filename and disposition != 'attachment':
+            continue
+        payload = part.get_payload(decode=True) or b''
+        attachments.append((filename or 'attachment.bin', payload))
+    return attachments
+
+
 def unread_message_keys_from_msf(msf_path: Path) -> Set[int]:
     if not msf_path.exists():
         return set()
@@ -227,10 +274,12 @@ def normalize(text: Optional[str]) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def parse_cli_datetime(value: str) -> float:
+def parse_cli_datetime(value: str, *, end_of_day: bool = False) -> float:
     text = value.strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
         dt = datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
         return dt.timestamp()
     normalized = text.replace("Z", "+00:00")
     try:
@@ -259,8 +308,19 @@ def date_sort_key(date_header: Optional[str]) -> float:
         return 0.0
 
 
-def message_record(msg: email.message.Message, source: str, include_body: bool = False, unread: Optional[bool] = None, message_key: Optional[int] = None) -> Dict[str, object]:
+def message_record(
+    msg: email.message.Message,
+    source: str,
+    include_body: bool = False,
+    unread: Optional[bool] = None,
+    message_key: Optional[int] = None,
+    include_attachments: bool = False,
+) -> Dict[str, object]:
     body = message_to_text(msg)
+    attachment_names: List[str] = []
+    if include_attachments:
+        attachments = extract_attachments(msg)
+        attachment_names = [name for name, _ in attachments]
     date_header = normalize(msg.get("date"))
     record: Dict[str, object] = {
         "source": source,
@@ -274,6 +334,9 @@ def message_record(msg: email.message.Message, source: str, include_body: bool =
         "unread": unread,
         "message_key": message_key,
     }
+    if include_attachments:
+        record["has_attachments"] = bool(attachment_names)
+        record["attachment_names"] = attachment_names
     if include_body:
         record["body"] = body
     return record
@@ -305,6 +368,12 @@ def matches_filters(record: Dict[str, object], args: argparse.Namespace) -> bool
         return False
     if args.exclude and args.exclude.lower() in full_haystack:
         return False
+    if args.has_attachment and record.get("has_attachments") is not True:
+        return False
+    if args.attachment_name:
+        attachment_names = [str(name).lower() for name in record.get("attachment_names", [])]
+        if not any(args.attachment_name.lower() in name for name in attachment_names):
+            return False
     if args.sender and args.sender.lower() not in from_text.lower():
         return False
     if args.recipient and args.recipient.lower() not in to_text.lower():
@@ -314,7 +383,30 @@ def matches_filters(record: Dict[str, object], args: argparse.Namespace) -> bool
     return True
 
 
+def maybe_save_attachments(msg: email.message.Message, record: Dict[str, object], args: argparse.Namespace) -> None:
+    if not args.save_attachments:
+        return
+    output_dir = Path(args.save_attachments)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    saved_paths: List[str] = []
+    for filename, payload in extract_attachments(msg):
+        if args.attachment_name and args.attachment_name.lower() not in filename.lower():
+            continue
+        target = output_dir / sanitize_filename(filename)
+        base = target.stem
+        suffix = target.suffix
+        counter = 1
+        while target.exists():
+            target = output_dir / f"{base}-{counter}{suffix}"
+            counter += 1
+        target.write_bytes(payload)
+        saved_paths.append(str(target))
+    if saved_paths:
+        record["saved_attachments"] = saved_paths
+
+
 def search_mbox(path: Path, args: argparse.Namespace) -> Iterator[Dict[str, object]]:
+    include_attachments = any([args.has_attachment, args.attachment_name, args.list_attachments, args.save_attachments])
     unread_keys = unread_message_keys_from_msf(path.with_suffix(path.suffix + ".msf"))
     mbox = mailbox.mbox(path, factory=lambda f: email.message_from_binary_file(f, policy=policy.default))
     for key, msg in mbox.iteritems():
@@ -323,16 +415,35 @@ def search_mbox(path: Path, args: argparse.Namespace) -> Iterator[Dict[str, obje
         except Exception:
             message_key = None
         unread = message_key in unread_keys if message_key is not None else None
-        record = message_record(msg, str(path), include_body=args.show_body, unread=unread, message_key=message_key)
+        record = message_record(
+            msg,
+            str(path),
+            include_body=args.show_body,
+            unread=unread,
+            message_key=message_key,
+            include_attachments=include_attachments,
+        )
         if matches_filters(record, args):
+            if args.save_attachments:
+                record["_message"] = msg
             yield record
 
 
 def search_maildir(path: Path, args: argparse.Namespace) -> Iterator[Dict[str, object]]:
+    include_attachments = any([args.has_attachment, args.attachment_name, args.list_attachments, args.save_attachments])
     md = mailbox.Maildir(path, factory=lambda f: email.message_from_binary_file(f, policy=policy.default), create=False)
     for key, msg in md.iteritems():
-        record = message_record(msg, str(path), include_body=args.show_body, unread=None, message_key=None)
+        record = message_record(
+            msg,
+            str(path),
+            include_body=args.show_body,
+            unread=None,
+            message_key=None,
+            include_attachments=include_attachments,
+        )
         if matches_filters(record, args):
+            if args.save_attachments:
+                record["_message"] = msg
             yield record
 
 
@@ -348,13 +459,17 @@ def sort_value(record: Dict[str, object], sort_by: str) -> object:
     return float(record.get("date_sort", 0) or 0)
 
 
-def print_record(record: Dict[str, object], show_body: bool = False) -> None:
+def print_record(record: Dict[str, object], show_body: bool = False, list_attachments: bool = False) -> None:
     print(f"Source:   {record['source']}")
     print(f"Date:     {record['date']}")
     print(f"Unread:   {record.get('unread')}")
     print(f"From:     {record['from']}")
     print(f"To:       {record['to']}")
     print(f"Subject:  {record['subject']}")
+    if list_attachments:
+        print(f"Attachments: {', '.join(record.get('attachment_names', [])) if record.get('attachment_names') else 'None'}")
+    if record.get("saved_attachments"):
+        print(f"Saved:    {', '.join(record.get('saved_attachments', []))}")
     if show_body:
         print("Body:")
         print(record.get("body", ""))
@@ -374,6 +489,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude", help="Exclude results containing this substring anywhere in the message summary/body")
     parser.add_argument("--subject-only", action="store_true", help="Apply --query only to the subject")
     parser.add_argument("--body-only", action="store_true", help="Apply --query only to the body/preview")
+    parser.add_argument("--has-attachment", action="store_true", help="Return only messages that contain at least one attachment")
+    parser.add_argument("--attachment-name", help="Return only messages with an attachment whose filename contains this substring")
+    parser.add_argument("--list-attachments", action="store_true", help="Include attachment names in output")
+    parser.add_argument("--save-attachments", help="Directory where matching message attachments should be saved")
     parser.add_argument("--from", dest="sender", help="Filter sender")
     parser.add_argument("--to", dest="recipient", help="Filter recipient")
     parser.add_argument("--subject", help="Filter subject")
@@ -390,6 +509,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.subject_only and args.body_only:
         raise SystemExit("Use either --subject-only or --body-only, not both")
+    if args.save_attachments and not args.has_attachment and not args.attachment_name:
+        args.has_attachment = True
     if args.today and args.yesterday:
         raise SystemExit("Use either --today or --yesterday, not both")
     if (args.today or args.yesterday) and (args.since or args.until):
@@ -400,7 +521,9 @@ def parse_args() -> argparse.Namespace:
         args.since_ts, args.until_ts = day_range_utc(-1)
     else:
         args.since_ts = parse_cli_datetime(args.since) if args.since else None
-        args.until_ts = parse_cli_datetime(args.until) if args.until else None
+        args.until_ts = parse_cli_datetime(args.until, end_of_day=True) if args.until else None
+    if args.since_ts is not None and args.until_ts is not None and args.since_ts > args.until_ts:
+        raise SystemExit("--since must be earlier than or equal to --until")
     return args
 
 
@@ -436,7 +559,7 @@ def main() -> int:
         return 0
 
     account = resolve_account(profile, args.account)
-    results: List[Dict[str, str]] = []
+    results: List[Dict[str, object]] = []
 
     for mbox_path in iter_mbox_files(profile, account=account, folder=args.folder):
         for record in search_mbox(mbox_path, args):
@@ -448,9 +571,17 @@ def main() -> int:
 
     results.sort(key=lambda record: sort_value(record, args.sort_by), reverse=(args.sort_order == "desc"))
     results = results[:args.limit]
+    if args.save_attachments:
+        for record in results:
+            raw_message = record.pop("_message", None)
+            if isinstance(raw_message, email.message.Message):
+                maybe_save_attachments(raw_message, record, args)
     for record in results:
+        record.pop("_message", None)
         record.pop("date_sort", None)
         record.pop("message_key", None)
+        if not args.list_attachments:
+            record.pop("attachment_names", None)
 
     if args.json:
         print(json.dumps({"profile": str(profile), "account": account, "folder": args.folder, "results": results}, indent=2, ensure_ascii=False))
@@ -459,7 +590,7 @@ def main() -> int:
         print(f"Results: {len(results)}")
         print("=" * 80)
         for record in results:
-            print_record(record, show_body=args.show_body)
+            print_record(record, show_body=args.show_body, list_attachments=args.list_attachments)
 
     return 0
 
